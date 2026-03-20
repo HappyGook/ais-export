@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 from influxdb import DataFrameClient
+from influxdb import InfluxDBClient
 
 # First - tunnel the port, so script can reach the db
 # (This is done from another terminal)
@@ -24,20 +25,30 @@ AREAS = [
         'name': 'Kiel_Fjord',
         'lat_min': 54.312117,
         'lat_max': 54.456069,
-        'long_min': 10.130081,
-        'long_max': 10.309982
+        'lon_min': 10.130081,
+        'lon_max': 10.309982
     },
     {
         'name': 'Kiel_Canal',
         'lat_min': 53.883297,
         'lat_max': 54.373758,
-        'long_min': 9.077005,
-        'long_max': 10.130368
+        'lon_min': 9.077005,
+        'lon_max': 10.130368
     },
 ]
 
+# Helper data formatting function
+def cast_to_df(dates):
+    points = list(dates.get_points())
+    if not points:
+        return pd.DataFrame()
+    df = pd.DataFrame(points)
+    df['time'] = pd.to_datetime(df['time'], format='ISO8601', utc=True)
+    df = df.set_index('time').sort_index()
+    return df
+
 # Connect
-client = DataFrameClient(host=HOST, port=PORT, database=DATABASE)
+client = InfluxDBClient(host=HOST, port=PORT, database=DATABASE)
 
 # Reachability check
 dbs = client.get_list_database()
@@ -75,15 +86,16 @@ for year in YEARS:
         ORDER BY time ASC
     ''')
 
-    if 'navigation.position' not in result:
-        print(f"  No data for {year}, skipping")
+
+    df = cast_to_df(result)
+
+    if df.empty:
+        print(f"  No data for {year}, skipping.")
         continue
 
-    df = result['navigation.position']
-    df.index = pd.to_datetime(df.index, format='ISO8601', utc=True)
     print(f"  Fetched {len(df):,} rows")
-
-    # Filter by area
+    
+     # Filter by area
     area_frames = []
     for area in AREAS:
         mask = (
