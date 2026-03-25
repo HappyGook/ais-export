@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pandas as pd
-from influxdb import DataFrameClient
 from influxdb import InfluxDBClient
 
 # First - tunnel the port, so script can reach the db
@@ -37,39 +36,30 @@ AREAS = [
     },
 ]
 
+# Split extras for dynamic entries (query iteratively)
+EXTRA_DYNAMIC = {
+    "navigation.courseOverGroundTrue": "value",
+}
+
+# Static entries (queried once via context and propagated)
+EXTRA_STATIC = {
+    "registrations": "jsonValue",
+    "design.aisShipType": "jsonValue",
+    "name": "stringValue",
+}
+
 # Helper data formatting function
 def cast_to_df(dates):
     points = list(dates.get_points())
     if not points:
         return pd.DataFrame()
-    df = pd.DataFrame(points)
-    df['time'] = pd.to_datetime(df['time'], format='ISO8601', utc=True)
-    df = df.set_index('time').sort_index()
-    return df
+    dframe = pd.DataFrame(points)
+    dframe['time'] = pd.to_datetime(dframe['time'], format='ISO8601', utc=True)
+    dframe = dframe.set_index('time').sort_index()
+    return dframe
 
 # Connect
 client = InfluxDBClient(host=HOST, port=PORT, database=DATABASE)
-
-# Reachability check
-dbs = client.get_list_database()
-print("Databases found:", [d['name'] for d in dbs])
-
-# Sample query
-result = client.query(f'''
-    SELECT time, lat, lon
-    FROM "navigation.position"
-    WHERE context = '{CONTEXT}'
-    ORDER BY time ASC
-    LIMIT 10
-''')
-
-if 'navigation.position' not in result:
-    print(f"No position data returned for MMSI: {MMSI}")
-else:
-    df = result['navigation.position']
-    print(f"\nShape: {df.shape}")
-    print(f"Time range: {df.index.min()} → {df.index.max()}")
-    print(f"\nFirst rows:\n{df.head()}")
 
 # Get the data for each area for every year
 for year in YEARS:
@@ -79,7 +69,7 @@ for year in YEARS:
     end = f"{year + 1}-01-01T00:00:00Z"
 
     result = client.query(f'''
-        SELECT lat, lon
+        SELECT lat, lon, context
         FROM "navigation.position"
         WHERE context = '{CONTEXT}'
         AND time >= '{start}' AND time < '{end}'
@@ -94,6 +84,51 @@ for year in YEARS:
         continue
 
     print(f"  Fetched {len(df):,} rows")
+
+    # Query static metadata
+    static_meta = {}
+    for measurement, col in EXTRA_STATIC.items():
+        result = client.query(f'''
+            SELECT {col}
+            FROM "{measurement}"
+            WHERE context = '{CONTEXT}'
+            LIMIT 1
+        ''')
+        points = list(result.get_points())
+        if points:
+            static_meta[measurement] = points[0][col]
+        else:
+            static_meta[measurement] = None
+
+    print("Static metadata:", static_meta)
+    for measurement, value in static_meta.items():
+        df[measurement] = value
+
+    # Extra measurements
+    for measurement, col in EXTRA_DYNAMIC.items():
+        extra_result = client.query(f'''
+            SELECT {col}
+            FROM "{measurement}"
+            WHERE context = '{CONTEXT}'
+            AND time >= '{start}' AND time < '{end}'
+            ORDER BY time ASC
+        ''')
+
+        extra_df = cast_to_df(extra_result)
+        if not extra_df.empty:
+            extra_df = extra_df[[col]].rename(columns={col: measurement})
+
+            # Reset index for merge_asof (needs a column, not an index)
+            df_reset = df.reset_index()
+            extra_reset = extra_df.reset_index()
+
+            merged = pd.merge_asof(
+                df_reset,
+                extra_reset[['time', measurement]],
+                on='time',
+                direction='backward'  # use the last known value
+            )
+            df = merged.set_index('time')
     
      # Filter by area
     area_frames = []
