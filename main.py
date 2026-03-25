@@ -164,6 +164,50 @@ for year in YEARS:
         print(f"  No rows matched any area for {year}, skipping CSV")
         continue
 
+    companion_frames = []
+    for area in AREAS:
+        # Timestamps when wavelab was in the area
+        wavelab_times = year_df[year_df['area'] == area['name']].index
+        if wavelab_times.empty:
+            continue
+
+        # Query all other ships in this bounding box for the year
+        comp_result = client.query(f'''
+                SELECT lat, lon, context
+                FROM "navigation.position"
+                WHERE 
+                lon < {area['lon_max']} AND lon > {area['lon_min']} 
+                AND
+                lat < {area['lat_max']} AND lat > {area['lat_min']} 
+                AND
+                time >= '{start}' AND time < '{end}'
+                ORDER BY time ASC
+            ''')
+
+        comp_df = cast_to_df(comp_result)
+        if comp_df.empty:
+            continue
+
+        # Keep only rows within ±30s of wavelab timestamp
+        tolerance = pd.Timedelta('30s')
+        mask = comp_df.index.map(
+            lambda t: ((wavelab_times - t).abs() <= tolerance).any()
+        )
+        comp_df = comp_df[mask].copy()
+        comp_df['area'] = area['name']
+
+        if comp_df.empty:
+            continue
+
+        for context in comp_df['context'].unique():
+            comp_static, comp_dynamic = gather_extras(client, context, EXTRA_STATIC, EXTRA_DYNAMIC)
+            comp_df = apply_extras(comp_df, comp_static, comp_dynamic)
+
+        companion_frames.append(comp_df)
+
+    all_frames = [year_df] + companion_frames
+    year_df = pd.concat(all_frames).sort_index()
+
     # Export
     out_path = OUTPUT / f"wavelab_{year}.csv"
     year_df.to_csv(out_path, index=True, index_label='time')
