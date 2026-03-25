@@ -58,6 +58,62 @@ def cast_to_df(dates):
     dframe = dframe.set_index('time').sort_index()
     return dframe
 
+# Helper function to gather statics & extras
+def gather_extras(client, context, extra_static, extra_dynamic, start=None, end=None):
+
+    static_meta = {}
+    for measurement, col in extra_static.items():
+        result = client.query(f'''
+            SELECT {col}
+            FROM "{measurement}"
+            WHERE context = '{context}'
+            ORDER BY time DESC
+            LIMIT 1
+        ''')
+        points = list(result.get_points())
+        static_meta[measurement] = points[0][col] if points else None
+
+    dynamic_df = pd.DataFrame()
+    if start and end:
+        frames = {}
+        for measurement, col in extra_dynamic.items():
+            result = client.query(f'''
+                SELECT {col}
+                FROM "{measurement}"
+                WHERE context = '{context}'
+                AND time >= '{start}' AND time < '{end}'
+                ORDER BY time ASC
+            ''')
+            extra_df = cast_to_df(result)
+            if not extra_df.empty:
+                frames[measurement] = extra_df[[col]].rename(columns={col: measurement})
+
+        if frames:
+            dynamic_df = pd.concat(frames.values(), axis=1)
+
+    return static_meta, dynamic_df
+
+# Add the gathered extras to the dataframe
+def apply_extras(df, static_meta, dynamic_df):
+
+    for measurement, value in static_meta.items():
+        df[measurement] = value
+
+    if not dynamic_df.empty:
+        df_reset = df.reset_index()
+        dyn_reset = dynamic_df.reset_index()
+
+        for col in dynamic_df.columns:
+            df_reset = pd.merge_asof(
+                df_reset,
+                dyn_reset[['time', col]],
+                on='time',
+                direction='backward'
+            )
+        df = df_reset.set_index('time')
+
+    return df
+
 # Connect
 client = InfluxDBClient(host=HOST, port=PORT, database=DATABASE)
 
@@ -85,50 +141,9 @@ for year in YEARS:
 
     print(f"  Fetched {len(df):,} rows")
 
-    # Query static metadata
-    static_meta = {}
-    for measurement, col in EXTRA_STATIC.items():
-        result = client.query(f'''
-            SELECT {col}
-            FROM "{measurement}"
-            WHERE context = '{CONTEXT}'
-            LIMIT 1
-        ''')
-        points = list(result.get_points())
-        if points:
-            static_meta[measurement] = points[0][col]
-        else:
-            static_meta[measurement] = None
+    static_meta, dynamic_df = gather_extras(client, CONTEXT, EXTRA_STATIC, EXTRA_DYNAMIC, start, end)
 
-    print("Static metadata:", static_meta)
-    for measurement, value in static_meta.items():
-        df[measurement] = value
-
-    # Extra measurements
-    for measurement, col in EXTRA_DYNAMIC.items():
-        extra_result = client.query(f'''
-            SELECT {col}
-            FROM "{measurement}"
-            WHERE context = '{CONTEXT}'
-            AND time >= '{start}' AND time < '{end}'
-            ORDER BY time ASC
-        ''')
-
-        extra_df = cast_to_df(extra_result)
-        if not extra_df.empty:
-            extra_df = extra_df[[col]].rename(columns={col: measurement})
-
-            # Reset index for merge_asof (needs a column, not an index)
-            df_reset = df.reset_index()
-            extra_reset = extra_df.reset_index()
-
-            merged = pd.merge_asof(
-                df_reset,
-                extra_reset[['time', measurement]],
-                on='time',
-                direction='backward'  # use the last known value
-            )
-            df = merged.set_index('time')
+    df = apply_extras(df, static_meta, dynamic_df)
     
      # Filter by area
     area_frames = []
