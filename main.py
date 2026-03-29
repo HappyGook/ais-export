@@ -15,7 +15,7 @@ DATABASE = 'boatdata'
 MMSI = '211891460'
 CONTEXT = f'vessels.urn:mrn:imo:mmsi:{MMSI}'
 
-YEARS    = range(2022, 2024)
+YEARS    = range(2023, 2024)
 OUTPUT   = Path('output')
 OUTPUT.mkdir(exist_ok=True)
 
@@ -158,6 +158,12 @@ for year in YEARS:
     static_meta, dynamic_df = gather_extras(client, CONTEXT, EXTRA_STATIC, EXTRA_DYNAMIC, start, end)
 
     df = apply_extras(df, static_meta, dynamic_df)
+
+    # Filtering out the moored states
+    df = df[df['navigation.state'] != 'moored']
+    if df.empty:
+        print(f"  All rows were moored for {year}, skipping.")
+        continue
     
      # Filter by area
     area_frames = []
@@ -182,9 +188,11 @@ for year in YEARS:
     extras_cache = {}
     checked_positions = set()
 
-
+    wl_counter = 0
     for ts, wl_row in year_df.iterrows():
-        print(f"============Current timestamp: {ts} ========\n"
+        wl_counter +=1
+        completion = (wl_counter-1)/len(year_df)*100
+        print(f"============ Timestamp No. {wl_counter} ({completion}% finished): {ts} ===========\n"
               f"wavelab infos at timestamp: {wl_row}")
         state = wl_row['navigation.state']
         if pd.isna(state) or state == "moored": continue
