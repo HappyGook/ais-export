@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -7,14 +8,15 @@ from influxdb import InfluxDBClient
 # (This is done from another terminal)
 # ssh -N -L 8086:127.0.0.1:8086 user@server
 
-# Connection config
+# Connection & Export config
 HOST = '127.0.0.1'
 PORT = 8086
 DATABASE = 'boatdata'
 MMSI = '211891460'
 CONTEXT = f'vessels.urn:mrn:imo:mmsi:{MMSI}'
+START = f"2026-03-06T00:00:00Z"
+END = f"2026-03-06T23:59:00Z"
 
-YEARS    = range(2022, 2024)
 OUTPUT   = Path('output')
 OUTPUT.mkdir(exist_ok=True)
 
@@ -39,6 +41,7 @@ AREAS = [
 # Split extras for dynamic entries (query iteratively)
 EXTRA_DYNAMIC = {
     "navigation.courseOverGroundTrue": "value",
+    "navigation.state":"stringValue"
 }
 
 # Static entries (queried once via context and propagated)
@@ -114,59 +117,130 @@ def apply_extras(df, static_meta, dynamic_df):
 
     return df
 
+# Function that defines the dynamic bounding box
+# 1 deg lat as 111.32 km; 1 deg lon 111.32*cos(lat) km
+def get_dynamic_bbox(pos_lat, pos_lon):
+    lat_offset = 1.0 / 111.32
+    lon_offset = 1.0 / (111.32 * math.cos(math.radians(pos_lat)))
+    return {
+        'lat_min': pos_lat - lat_offset,
+        'lat_max': pos_lat + lat_offset,
+        'lon_min': pos_lon - lon_offset,
+        'lon_max': pos_lon + lon_offset,
+    }
+
 # Connect
 client = InfluxDBClient(host=HOST, port=PORT, database=DATABASE)
 
-# Get the data for each area for every year
-for year in YEARS:
-    print(f"\nYEAR: {year}")
+# Get the data for the given period
+result = client.query(f'''
+    SELECT lat, lon, context
+    FROM "navigation.position"
+    WHERE context = '{CONTEXT}'
+    AND time >= '{START}' AND time < '{END}'
+    ORDER BY time ASC
+''')
 
-    start = f"{year}-01-01T00:00:00Z"
-    end = f"{year + 1}-01-01T00:00:00Z"
+df = cast_to_df(result)
 
-    result = client.query(f'''
-        SELECT lat, lon, context
-        FROM "navigation.position"
-        WHERE context = '{CONTEXT}'
-        AND time >= '{start}' AND time < '{end}'
-        ORDER BY time ASC
-    ''')
+if df.empty:
+    print(f"  No data for the given period, skipping.")
 
+print(f"  Fetched {len(df):,} rows")
 
-    df = cast_to_df(result)
+static_meta, dynamic_df = gather_extras(client, CONTEXT, EXTRA_STATIC, EXTRA_DYNAMIC, START, END)
 
-    if df.empty:
-        print(f"  No data for {year}, skipping.")
+df = apply_extras(df, static_meta, dynamic_df)
+
+# Filtering out the moored states
+df = df[df['navigation.state'] != 'moored']
+if df.empty:
+    print(f"  All rows were moored for the given period, skipping.")
+
+# Filter by area
+area_frames = []
+for area in AREAS:
+    mask = (
+            (df['lat'] > area['lat_min']) & (df['lat'] < area['lat_max']) &
+            (df['lon'] > area['lon_min']) & (df['lon'] < area['lon_max'])
+    )
+    filtered = df[mask].copy()
+    filtered['area'] = area['name']
+    area_frames.append(filtered)
+    print(f"  {area['name']}: {len(filtered):,} rows matched")
+
+# Combine both areas
+year_df = pd.concat(area_frames).sort_index()
+
+if year_df.empty:
+    print(f"  No rows matched any area for the given period, skipping CSV")
+
+companion_frames = []
+extras_cache = {}
+checked_positions = set()
+
+wl_counter = 0
+for ts, wl_row in year_df.iterrows():
+    wl_counter += 1
+    completion = (wl_counter - 1) / len(year_df) * 100
+    print(f"============ Timestamp No. {wl_counter} ({completion}% finished): {ts} ===========\n"
+          f"wavelab infos at timestamp: {wl_row}")
+    state = wl_row['navigation.state']
+    if pd.isna(state) or state == "moored": continue
+    bbox = get_dynamic_bbox(wl_row['lat'], wl_row['lon'])
+
+    time_start = (ts - pd.Timedelta('30s')).strftime('%Y-%m-%dT%H:%M:%SZ')
+    time_end = (ts + pd.Timedelta('30s')).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    comp_result = client.query(f'''
+                    SELECT lat, lon, context
+                    FROM "navigation.position"
+                    WHERE 
+                    lon < {bbox['lon_max']} AND lon > {bbox['lon_min']} 
+                    AND
+                    lat < {bbox['lat_max']} AND lat > {bbox['lat_min']} 
+                    AND
+                    time >= '{time_start}' AND time < '{time_end}'
+                    ORDER BY time ASC
+                ''')
+
+    comp_df = cast_to_df(comp_result)
+    comp_df = comp_df[
+        [(ctx, name) not in checked_positions
+         for ctx, name in zip(comp_df['context'], comp_df.index)]
+    ]
+    checked_positions.update(zip(comp_df['context'], comp_df.index))
+
+    print(f"  {len(comp_df):,} companion rows matched")
+
+    if comp_df.empty:
         continue
 
-    print(f"  Fetched {len(df):,} rows")
+    added_ships = []
+    counter = 0
+    for context in comp_df['context'].unique():
+        counter += 1
+        print(f"Gathering extras for {context}. \n "
+              f"This is the unique entry number: {counter}")
+        sub = comp_df[comp_df['context'] == context].copy()
+        if context not in extras_cache:
+            extras_cache[context] = gather_extras(
+                client, context, EXTRA_STATIC, EXTRA_DYNAMIC, time_start, time_end
+            )
+        comp_static, comp_dynamic = extras_cache[context]
+        sub = apply_extras(sub, comp_static, comp_dynamic)
+        added_ships.append(sub)
 
-    static_meta, dynamic_df = gather_extras(client, CONTEXT, EXTRA_STATIC, EXTRA_DYNAMIC, start, end)
+    comp_df = pd.concat(added_ships).sort_index()
 
-    df = apply_extras(df, static_meta, dynamic_df)
-    
-     # Filter by area
-    area_frames = []
-    for area in AREAS:
-        mask = (
-                (df['lat'] > area['lat_min']) & (df['lat'] < area['lat_max']) &
-                (df['lon'] > area['lon_min']) & (df['lon'] < area['lon_max'])
-        )
-        filtered = df[mask].copy()
-        filtered['area'] = area['name']
-        area_frames.append(filtered)
-        print(f"  {area['name']}: {len(filtered):,} rows matched")
+    companion_frames.append(comp_df)
 
-    # Combine both areas for this year
-    year_df = pd.concat(area_frames).sort_index()
+all_frames = [year_df] + companion_frames
+year_df = pd.concat(all_frames).sort_index()
 
-    if year_df.empty:
-        print(f"  No rows matched any area for {year}, skipping CSV")
-        continue
-
-    # Export
-    out_path = OUTPUT / f"wavelab_{year}.csv"
-    year_df.to_csv(out_path, index=True, index_label='time')
-    print(f"  Saved to the {out_path}  ({len(year_df):,} rows total)")
+# Export
+out_path = OUTPUT / f"wavelab_{START}-{END}.csv"
+year_df.to_csv(out_path, index=True, index_label='time')
+print(f"  Saved to the {out_path}  ({len(year_df):,} rows total)")
 
 print("\n FINISHED")
