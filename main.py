@@ -1,6 +1,5 @@
 import math
-from pathlib import Path
-
+import config
 import pandas as pd
 from influxdb import InfluxDBClient
 
@@ -8,48 +7,7 @@ from influxdb import InfluxDBClient
 # (This is done from another terminal)
 # ssh -N -L 8086:127.0.0.1:8086 user@server
 
-# Connection & Export config
-HOST = '127.0.0.1'
-PORT = 8086
-DATABASE = 'boatdata'
-MMSI = '211891460'
-CONTEXT = f'vessels.urn:mrn:imo:mmsi:{MMSI}'
-START = f"2026-03-06T00:00:00Z"
-END = f"2026-03-06T23:59:00Z"
 
-OUTPUT   = Path('output')
-OUTPUT.mkdir(exist_ok=True)
-
-# Bounding boxes for the areas
-AREAS = [
-    {
-        'name': 'Kiel_Fjord',
-        'lat_min': 54.312117,
-        'lat_max': 54.456069,
-        'lon_min': 10.130081,
-        'lon_max': 10.309982
-    },
-    {
-        'name': 'Kiel_Canal',
-        'lat_min': 53.883297,
-        'lat_max': 54.373758,
-        'lon_min': 9.077005,
-        'lon_max': 10.130368
-    },
-]
-
-# Split extras for dynamic entries (query iteratively)
-EXTRA_DYNAMIC = {
-    "navigation.courseOverGroundTrue": "value",
-    "navigation.state":"stringValue"
-}
-
-# Static entries (queried once via context and propagated)
-EXTRA_STATIC = {
-    "registrations": "jsonValue",
-    "design.aisShipType": "jsonValue",
-    "name": "stringValue",
-}
 
 # Helper data formatting function
 def cast_to_df(dates):
@@ -130,14 +88,14 @@ def get_dynamic_bbox(pos_lat, pos_lon):
     }
 
 # Connect
-client = InfluxDBClient(host=HOST, port=PORT, database=DATABASE)
+client = InfluxDBClient(host=config.HOST, port=config.PORT, database=config.DATABASE)
 
 # Get the data for the given period
 result = client.query(f'''
     SELECT lat, lon, context
     FROM "navigation.position"
-    WHERE context = '{CONTEXT}'
-    AND time >= '{START}' AND time < '{END}'
+    WHERE context = '{config.CONTEXT}'
+    AND time >= '{config.START}' AND time < '{config.END}'
     ORDER BY time ASC
 ''')
 
@@ -148,7 +106,8 @@ if df.empty:
 
 print(f"  Fetched {len(df):,} rows")
 
-static_meta, dynamic_df = gather_extras(client, CONTEXT, EXTRA_STATIC, EXTRA_DYNAMIC, START, END)
+static_meta, dynamic_df = gather_extras(client, config.CONTEXT, config.EXTRA_STATIC, config.EXTRA_DYNAMIC, config.START,
+                                        config.END)
 
 df = apply_extras(df, static_meta, dynamic_df)
 
@@ -159,7 +118,7 @@ if df.empty:
 
 # Filter by area
 area_frames = []
-for area in AREAS:
+for area in config.AREAS:
     mask = (
             (df['lat'] > area['lat_min']) & (df['lat'] < area['lat_max']) &
             (df['lon'] > area['lon_min']) & (df['lon'] < area['lon_max'])
@@ -225,7 +184,7 @@ for ts, wl_row in year_df.iterrows():
         sub = comp_df[comp_df['context'] == context].copy()
         if context not in extras_cache:
             extras_cache[context] = gather_extras(
-                client, context, EXTRA_STATIC, EXTRA_DYNAMIC, time_start, time_end
+                client, context, config.EXTRA_STATIC, config.EXTRA_DYNAMIC, time_start, time_end
             )
         comp_static, comp_dynamic = extras_cache[context]
         sub = apply_extras(sub, comp_static, comp_dynamic)
@@ -239,7 +198,7 @@ all_frames = [year_df] + companion_frames
 year_df = pd.concat(all_frames).sort_index()
 
 # Export
-out_path = OUTPUT / f"wavelab_{START}-{END}.csv"
+out_path = config.OUTPUT / f"wavelab_{config.START}-{config.END}.csv"
 year_df.to_csv(out_path, index=True, index_label='time')
 print(f"  Saved to the {out_path}  ({len(year_df):,} rows total)")
 
