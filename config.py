@@ -30,6 +30,32 @@ AREAS = [
     },
 ]
 
+# Set of bounding boxes for surfing areas
+SURF_AREAS = [
+    {
+        'name': 'Laboe',
+        'lat_min': 54.401809,
+        'lat_max': 54.419285,
+        'lon_min': 10.211116,
+        'lon_max': 10.241631
+    },
+    # Stein + Heidkate + Kalifornien + Schönberg
+    {
+        'name': 'Rightside',
+        'lat_min': 54.398203,
+        'lat_max': 54.448208,
+        'lon_min': 10.256328,
+        'lon_max': 10.462743
+    },
+    {
+        'name': 'Strande',
+        'lat_min': 54.435412,
+        'lat_max': 54.459829,
+        'lon_min': 10.169806,
+        'lon_max': 10.213505
+    },
+]
+
 # Split extras for dynamic entries (query iteratively)
 EXTRA_DYNAMIC = {
     "navigation.courseOverGroundTrue": "value",
