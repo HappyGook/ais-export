@@ -115,6 +115,7 @@ def append_companions(dataframe):
                         lat < {bbox['lat_max']} AND lat > {bbox['lat_min']} 
                         AND
                         time >= '{time_start}' AND time < '{time_end}'
+                        AND context != '{config.CONTEXT}'
                         ORDER BY time ASC
                     ''')
 
@@ -153,7 +154,7 @@ def append_companions(dataframe):
     all_frames = [dataframe] + companion_frames
     return pd.concat(all_frames).sort_index()
 
-# Query all wavelab
+# Query all wavelab's positions in the given period
 def all_in_period(influx_client):
     # Get the data for the given period
     result = influx_client.query(f'''
@@ -165,6 +166,36 @@ def all_in_period(influx_client):
         ''')
 
     return cast_to_df(result)
+
+# Query and label each area
+def surfing_query(influx_client):
+    area_dfs = []
+
+    for sa in config.SURF_AREAS:
+        result = influx_client.query(f'''
+            SELECT lat, lon, context
+            FROM "navigation.position"
+            WHERE context = '{config.CONTEXT}'
+            AND time >= '{config.START}' AND time < '{config.END}'
+            AND lat >= {sa['lat_min']} AND lat <= {sa['lat_max']}
+            AND lon >= {sa['lon_min']} AND lon <= {sa['lon_max']}
+            ORDER BY time ASC
+        ''')
+
+        frame = cast_to_df(result)
+        print(f"{len(frame)} rows matched for area {sa['name']}")
+
+        if frame.empty:
+            continue
+
+        frame['area'] = sa['name']
+        area_dfs.append(frame)
+
+    if not area_dfs:
+        return pd.DataFrame()
+
+    return pd.concat(area_dfs).sort_index()
+
 
 # add a label to all areas as a column in the dataframe
 def label_area(dataframe):
@@ -187,7 +218,7 @@ if __name__ == "__main__":
     client = InfluxDBClient(host=config.HOST, port=config.PORT, database=config.DATABASE)
 
 
-    df = all_in_period(client)
+    df = surfing_query(client)
 
     if df.empty:
         print(f"  No data for the given period, skipping.")
@@ -197,7 +228,6 @@ if __name__ == "__main__":
     static_meta, dynamic_df = gather_extras(client, config.CONTEXT, config.EXTRA_STATIC, config.EXTRA_DYNAMIC,
                                             config.START,
                                             config.END)
-
     df = apply_extras(df, static_meta, dynamic_df)
 
     # Filtering out the moored states
@@ -205,20 +235,15 @@ if __name__ == "__main__":
     if df.empty:
         print(f"  All rows were moored for the given period, skipping.")
 
-
-
-    # Combine both areas
-    labeled_df = label_area(df)
-
-    if labeled_df.empty:
+    if df.empty:
         print(f"  No rows matched any area for the given period, skipping CSV")
 
     # Add companion ships in the area
-    complete_df = append_companions(dataframe=labeled_df)
+    complete_df = append_companions(dataframe=df)
 
     # Export
     out_path = config.OUTPUT / f"wavelab_{config.START}-{config.END}.csv"
     complete_df.to_csv(out_path, index=True, index_label='time')
-    print(f"  Saved to the {out_path}  ({len(labeled_df):,} rows total)")
+    print(f"  Saved to the {out_path}  ({len(df):,} rows total)")
 
     print("\n FINISHED")
