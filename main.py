@@ -87,119 +87,138 @@ def get_dynamic_bbox(pos_lat, pos_lon):
         'lon_max': pos_lon + lon_offset,
     }
 
-# Connect
-client = InfluxDBClient(host=config.HOST, port=config.PORT, database=config.DATABASE)
+# Query the ships in the dynamic bbox and get their data + extras
+def append_companions(dataframe):
+    companion_frames = []
+    extras_cache = {}
+    checked_positions = set()
 
-# Get the data for the given period
-result = client.query(f'''
-    SELECT lat, lon, context
-    FROM "navigation.position"
-    WHERE context = '{config.CONTEXT}'
-    AND time >= '{config.START}' AND time < '{config.END}'
-    ORDER BY time ASC
-''')
+    wl_counter = 0
+    for ts, wl_row in dataframe.iterrows():
+        wl_counter += 1
+        completion = (wl_counter - 1) / len(dataframe) * 100
+        print(f"============ Timestamp No. {wl_counter} ({completion}% finished): {ts} ===========\n"
+              f"wavelab infos at timestamp: {wl_row}")
+        state = wl_row['navigation.state']
+        if pd.isna(state) or state == "moored": continue
+        bbox = get_dynamic_bbox(wl_row['lat'], wl_row['lon'])
 
-df = cast_to_df(result)
+        time_start = (ts - pd.Timedelta('30s')).strftime('%Y-%m-%dT%H:%M:%SZ')
+        time_end = (ts + pd.Timedelta('30s')).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-if df.empty:
-    print(f"  No data for the given period, skipping.")
+        comp_result = client.query(f'''
+                        SELECT lat, lon, context
+                        FROM "navigation.position"
+                        WHERE 
+                        lon < {bbox['lon_max']} AND lon > {bbox['lon_min']} 
+                        AND
+                        lat < {bbox['lat_max']} AND lat > {bbox['lat_min']} 
+                        AND
+                        time >= '{time_start}' AND time < '{time_end}'
+                        ORDER BY time ASC
+                    ''')
 
-print(f"  Fetched {len(df):,} rows")
+        comp_df = cast_to_df(comp_result)
+        comp_df = comp_df[
+            [(ctx, name) not in checked_positions
+             for ctx, name in zip(comp_df['context'], comp_df.index)]
+        ]
+        checked_positions.update(zip(comp_df['context'], comp_df.index))
 
-static_meta, dynamic_df = gather_extras(client, config.CONTEXT, config.EXTRA_STATIC, config.EXTRA_DYNAMIC, config.START,
-                                        config.END)
+        print(f"  {len(comp_df):,} companion rows matched")
 
-df = apply_extras(df, static_meta, dynamic_df)
+        if comp_df.empty:
+            continue
 
-# Filtering out the moored states
-df = df[df['navigation.state'] != 'moored']
-if df.empty:
-    print(f"  All rows were moored for the given period, skipping.")
+        added_ships = []
+        counter = 0
+        for context in comp_df['context'].unique():
+            counter += 1
+            print(f"Gathering extras for {context}. \n "
+                  f"This is the unique entry number: {counter}")
+            sub = comp_df[comp_df['context'] == context].copy()
+            if context not in extras_cache:
+                extras_cache[context] = gather_extras(
+                    client, context, config.EXTRA_STATIC, config.EXTRA_DYNAMIC, time_start, time_end
+                )
+            comp_static, comp_dynamic = extras_cache[context]
+            sub = apply_extras(sub, comp_static, comp_dynamic)
+            added_ships.append(sub)
 
-# Filter by area
-area_frames = []
-for area in config.AREAS:
-    mask = (
-            (df['lat'] > area['lat_min']) & (df['lat'] < area['lat_max']) &
-            (df['lon'] > area['lon_min']) & (df['lon'] < area['lon_max'])
-    )
-    filtered = df[mask].copy()
-    filtered['area'] = area['name']
-    area_frames.append(filtered)
-    print(f"  {area['name']}: {len(filtered):,} rows matched")
+        comp_df = pd.concat(added_ships).sort_index()
 
-# Combine both areas
-year_df = pd.concat(area_frames).sort_index()
+        companion_frames.append(comp_df)
 
-if year_df.empty:
-    print(f"  No rows matched any area for the given period, skipping CSV")
 
-companion_frames = []
-extras_cache = {}
-checked_positions = set()
+    all_frames = [dataframe] + companion_frames
+    return pd.concat(all_frames).sort_index()
 
-wl_counter = 0
-for ts, wl_row in year_df.iterrows():
-    wl_counter += 1
-    completion = (wl_counter - 1) / len(year_df) * 100
-    print(f"============ Timestamp No. {wl_counter} ({completion}% finished): {ts} ===========\n"
-          f"wavelab infos at timestamp: {wl_row}")
-    state = wl_row['navigation.state']
-    if pd.isna(state) or state == "moored": continue
-    bbox = get_dynamic_bbox(wl_row['lat'], wl_row['lon'])
+# Query all wavelab
+def all_in_period(influx_client):
+    # Get the data for the given period
+    result = influx_client.query(f'''
+            SELECT lat, lon, context
+            FROM "navigation.position"
+            WHERE context = '{config.CONTEXT}'
+            AND time >= '{config.START}' AND time < '{config.END}'
+            ORDER BY time ASC
+        ''')
 
-    time_start = (ts - pd.Timedelta('30s')).strftime('%Y-%m-%dT%H:%M:%SZ')
-    time_end = (ts + pd.Timedelta('30s')).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return cast_to_df(result)
 
-    comp_result = client.query(f'''
-                    SELECT lat, lon, context
-                    FROM "navigation.position"
-                    WHERE 
-                    lon < {bbox['lon_max']} AND lon > {bbox['lon_min']} 
-                    AND
-                    lat < {bbox['lat_max']} AND lat > {bbox['lat_min']} 
-                    AND
-                    time >= '{time_start}' AND time < '{time_end}'
-                    ORDER BY time ASC
-                ''')
+# add a label to all areas as a column in the dataframe
+def label_area(dataframe):
+    area_frames = []
+    for area in config.AREAS:
+        mask = (
+                (dataframe['lat'] > area['lat_min']) & (dataframe['lat'] < area['lat_max']) &
+                (dataframe['lon'] > area['lon_min']) & (dataframe['lon'] < area['lon_max'])
+        )
+        filtered = dataframe[mask].copy()
+        filtered['area'] = area['name']
+        area_frames.append(filtered)
+        print(f"  {area['name']}: {len(filtered):,} rows matched")
 
-    comp_df = cast_to_df(comp_result)
-    comp_df = comp_df[
-        [(ctx, name) not in checked_positions
-         for ctx, name in zip(comp_df['context'], comp_df.index)]
-    ]
-    checked_positions.update(zip(comp_df['context'], comp_df.index))
+    return pd.concat(area_frames).sort_index()
 
-    print(f"  {len(comp_df):,} companion rows matched")
 
-    if comp_df.empty:
-        continue
+if __name__ == "__main__":
+    # Connect
+    client = InfluxDBClient(host=config.HOST, port=config.PORT, database=config.DATABASE)
 
-    added_ships = []
-    counter = 0
-    for context in comp_df['context'].unique():
-        counter += 1
-        print(f"Gathering extras for {context}. \n "
-              f"This is the unique entry number: {counter}")
-        sub = comp_df[comp_df['context'] == context].copy()
-        if context not in extras_cache:
-            extras_cache[context] = gather_extras(
-                client, context, config.EXTRA_STATIC, config.EXTRA_DYNAMIC, time_start, time_end
-            )
-        comp_static, comp_dynamic = extras_cache[context]
-        sub = apply_extras(sub, comp_static, comp_dynamic)
-        added_ships.append(sub)
 
-    comp_df = pd.concat(added_ships).sort_index()
+    df = all_in_period(client)
 
-    companion_frames.append(comp_df)
+    if df.empty:
+        print(f"  No data for the given period, skipping.")
 
-all_frames = [year_df] + companion_frames
-year_df = pd.concat(all_frames).sort_index()
+    print(f"  Fetched {len(df):,} rows")
 
-# Export
-out_path = config.OUTPUT / f"wavelab_{config.START}-{config.END}.csv"
-year_df.to_csv(out_path, index=True, index_label='time')
-print(f"  Saved to the {out_path}  ({len(year_df):,} rows total)")
+    static_meta, dynamic_df = gather_extras(client, config.CONTEXT, config.EXTRA_STATIC, config.EXTRA_DYNAMIC,
+                                            config.START,
+                                            config.END)
 
-print("\n FINISHED")
+    df = apply_extras(df, static_meta, dynamic_df)
+
+    # Filtering out the moored states
+    df = df[df['navigation.state'] != 'moored']
+    if df.empty:
+        print(f"  All rows were moored for the given period, skipping.")
+
+
+
+    # Combine both areas
+    labeled_df = label_area(df)
+
+    if labeled_df.empty:
+        print(f"  No rows matched any area for the given period, skipping CSV")
+
+    # Add companion ships in the area
+    complete_df = append_companions(dataframe=labeled_df)
+
+    # Export
+    out_path = config.OUTPUT / f"wavelab_{config.START}-{config.END}.csv"
+    complete_df.to_csv(out_path, index=True, index_label='time')
+    print(f"  Saved to the {out_path}  ({len(labeled_df):,} rows total)")
+
+    print("\n FINISHED")
